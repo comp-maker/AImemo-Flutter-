@@ -89,6 +89,10 @@ class _HomePageState extends State<HomePage> {
   int? currentQuizId;
   bool loading = false;
 
+  // 상태 변수들 아래에 추가
+  bool _examMode = false;                 // ← 시험 모드 ON/OFF
+  final ScrollController _examScroll = ScrollController();
+
   static const int kNumQuestions = 10; // 항상 10문제 출제
   static const double kOverlayToolbarHeight = 48.0; // 오버레이 툴바 높이(아이콘/패딩 기준)
 
@@ -96,6 +100,16 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _refreshList();
+  }
+
+  @override
+  void dispose() {
+    titleCtl.dispose();
+    contentCtl.dispose();
+    _examScroll.dispose();
+    // Drift DB는 앱 종료 때 자동 정리되는 편이지만, 명시하고 싶다면:
+    // db.close();
+    super.dispose();
   }
 
   Future<void> _refreshList() async {
@@ -113,6 +127,7 @@ class _HomePageState extends State<HomePage> {
       quiz = [];
       userAnswers = [];
       currentQuizId = null;
+      _examMode = false; // ← 추가: 새 메모 시 시험 모드 해제
     });
     _refreshList();
   }
@@ -144,6 +159,7 @@ class _HomePageState extends State<HomePage> {
       quiz = [];
       userAnswers = [];
       currentQuizId = null;
+      _examMode = false; // ← 추가: 삭제 시 시험 모드 해제
     });
     _refreshList();
   }
@@ -168,13 +184,29 @@ class _HomePageState extends State<HomePage> {
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
+        final qs = (data['questions'] as List?) ?? [];
+        if (qs.isEmpty) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('생성된 문제가 없습니다. 내용을 더 자세히 써보세요.')),
+          );
+          setState(() => _examMode = false);
+          return;
+        }
         setState(() {
-          quiz = data['questions'] ?? [];
+          quiz = qs;
           userAnswers = List<int?>.filled(quiz.length, null);
         });
         // DB에 퀴즈 저장
         final quizId = await db.addQuiz(current!.id, jsonEncode(quiz));
-        setState(() => currentQuizId = quizId);
+        setState(() {
+          currentQuizId = quizId;
+          _examMode = true; // ← 시험 모드 진입
+        });
+        
+        // 문제 생성 후 자동 스크롤 맨 위
+        await Future.delayed(const Duration(milliseconds: 50));
+        _examScroll.jumpTo(0.0);
       } else {
         throw Exception('서버 오류: ${res.statusCode}');
       }
@@ -190,6 +222,18 @@ class _HomePageState extends State<HomePage> {
   Future<void> _submitAnswers() async {
     if (quiz.isEmpty || currentQuizId == null) return;
 
+    // 답변하지 않은 문항이 있는지 확인
+    if (userAnswers.any((e) => e == null)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('답변하지 않은 문항이 있습니다. 모든 문항에 답을 선택해주세요.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
     int score = 0;
     for (int i = 0; i < quiz.length; i++) {
       if (userAnswers[i] == quiz[i]['answerIndex']) {
@@ -200,11 +244,20 @@ class _HomePageState extends State<HomePage> {
     await db.addAttempt(currentQuizId!, jsonEncode(userAnswers), score);
 
     if (!mounted) return;
+    final total = quiz.length; // ← 실제 출제 문항 수
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('점수: ${score * 10}점 / ${kNumQuestions *
-          10}점 만점 (${score}/${kNumQuestions})')),
+      SnackBar(content: Text('점수: ${score * 10}점 / ${total * 10}점 만점 (${score}/${total})')),
     );
-    // 저장 후 통계를 갱신하고 싶으면 리스트 리프레시
+
+    // ⬇️ 시험 모드 종료 + 문제 패널 닫기
+    setState(() {
+      _examMode = false;
+      // 필요하면 문제는 남겨두고 싶다면 아래 두 줄은 주석 처리
+      // quiz = [];
+      // userAnswers = [];
+    });
+
+    // 통계 갱신 등
     _refreshList();
   }
 
@@ -323,6 +376,7 @@ class _HomePageState extends State<HomePage> {
                     quiz = [];
                     userAnswers = [];
                     currentQuizId = null;
+                    _examMode = false; // ← 추가: 메모 바꿀 때 시험 모드 해제
                   });
                 },
               ),
@@ -424,117 +478,177 @@ class _HomePageState extends State<HomePage> {
               // 구분선
               Container(width: 1, color: const Color(0xFF3C3C3C)),
 
-              // 우측: 에디터 + 퀴즈 (툴바 높이만큼 아래로 내리기)
+              // 우측: 에디터 또는 시험 모드
               Expanded(
                 child: Padding(
                   padding: EdgeInsets.only(top: kOverlayToolbarHeight + 8),
-                  // ★겹침 방지
-                  child: current == null
-                      ? const Center(
-                    child: Text('왼쪽에서 메모를 선택하거나 상단 + 로 새 메모를 만드세요'),
-                  )
-                      : Padding(
-                    padding: const EdgeInsets.all(14.0),
-                    child: Column(
-                      children: [
-                        TextField(
-                          controller: titleCtl,
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w600),
-                          decoration:
-                          const InputDecoration(hintText: '제목'),
-                        ),
-                        const SizedBox(height: 10),
-                        Expanded(
-                          child: TextField(
-                            controller: contentCtl,
-                            maxLines: null,
-                            expands: true,
-                            keyboardType: TextInputType.multiline,
-                            textAlign: TextAlign.start,
-                            textAlignVertical: TextAlignVertical.top,
-                            // 좌상단 시작
-                            decoration: const InputDecoration(
-                              hintText: '여기에 메모를 작성하세요…',
-                            ),
+                  child: _examMode
+                      // ===== 시험 모드 화면 =====
+                      ? Container(
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF252526), // panelBg
+                            border: Border.all(color: const Color(0xFF3C3C3C)),
+                            borderRadius: BorderRadius.circular(10),
                           ),
-                        ),
+                          child: Stack(
+                            children: [
+                              // 문제 리스트
+                              Positioned.fill(
+                                child: ListView.builder(
+                                  controller: _examScroll,
+                                  padding: const EdgeInsets.fromLTRB(14, 14, 14, 80),
+                                  itemCount: quiz.length,
+                                  itemBuilder: (context, idx) {
+                                    final q = quiz[idx];
+                                    final choices = (q['choices'] as List?) ?? [];
+                                    return Card(
+                                      margin: const EdgeInsets.only(bottom: 10),
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(12.0),
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text('${idx + 1}. ${q['q']}'),
+                                            const SizedBox(height: 8),
+                                            ...choices.asMap().entries.map((e) {
+                                              return RadioListTile<int>(
+                                                value: e.key,
+                                                groupValue: userAnswers[idx],
+                                                onChanged: (val) {
+                                                  setState(() => userAnswers[idx] = val);
+                                                },
+                                                title: Text(e.value.toString()),
+                                                dense: true,
+                                              );
+                                            }),
+                                          ],
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
 
-                        if (quiz.isNotEmpty) ...[
-                          const SizedBox(height: 12),
-                          Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: panelBg,
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(
-                                  color: const Color(0xFF3C3C3C)),
-                            ),
-                            child: const Text(
-                              '퀴즈 풀기 (10문제)',
-                              style: TextStyle(fontWeight: FontWeight.bold),
-                            ),
+                              // 상단 고정 바(시험 모드 표시 + 닫기)
+                              Positioned(
+                                left: 0,
+                                right: 0,
+                                top: 0,
+                                child: Container(
+                                  height: 44,
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFF2D2D2D),
+                                    border: Border(
+                                      bottom: BorderSide(color: Color(0xFF3C3C3C)),
+                                    ),
+                                    borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.assignment, size: 18, color: Colors.white70),
+                                      const SizedBox(width: 8),
+                                      const Text('시험 모드', style: TextStyle(fontWeight: FontWeight.bold)),
+                                      const Spacer(),
+                                                                             // (선택) 취소 버튼: 제출 없이 나가기
+                                                                               TextButton(
+                                          onPressed: () {
+                                            final answered = userAnswers.where((e) => e != null).length;
+                                            showDialog(
+                                              context: context,
+                                              builder: (context) => AlertDialog(
+                                                backgroundColor: const Color(0xFF252526),
+                                                title: const Text('시험 모드 종료'),
+                                                content: Text('제출하지 않고 나가시겠습니까?\n현재 ${answered}/${quiz.length}문항에 답했습니다.\n답변은 저장되지 않습니다.'),
+                                                actions: [
+                                                 TextButton(
+                                                   onPressed: () => Navigator.of(context).pop(),
+                                                   child: const Text('취소'),
+                                                 ),
+                                                 TextButton(
+                                                   onPressed: () {
+                                                     Navigator.of(context).pop();
+                                                     setState(() {
+                                                       _examMode = false;
+                                                       // 필요 시 문제 유지/초기화 선택
+                                                       // quiz = []; userAnswers = [];
+                                                     });
+                                                   },
+                                                   child: const Text('나가기'),
+                                                 ),
+                                               ],
+                                             ),
+                                           );
+                                         },
+                                         child: const Text('나가기'),
+                                       ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+
+                              // 하단 제출 버튼 고정
+                              Positioned(
+                                left: 0,
+                                right: 0,
+                                bottom: 0,
+                                child: Container(
+                                  height: 64,
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFF2D2D2D),
+                                    border: Border(
+                                      top: BorderSide(color: Color(0xFF3C3C3C)),
+                                    ),
+                                    borderRadius: BorderRadius.vertical(bottom: Radius.circular(10)),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                                                                     child: Row(
+                                     children: [
+                                       const Text('모든 문항에 답을 선택한 후 제출하세요'),
+                                       const Spacer(),
+                                       FilledButton(
+                                         onPressed: userAnswers.any((e) => e == null) ? null : _submitAnswers,
+                                         child: const Text('제출'),
+                                       ),
+                                     ],
+                                   ),
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(height: 8),
-                          SizedBox(
-                            height: 320,
-                            child: ListView(
-                              children:
-                              quiz
-                                  .asMap()
-                                  .entries
-                                  .map<Widget>((entry) {
-                                final i = entry.key;
-                                final q = entry.value;
-                                final choices =
-                                    (q['choices'] as List?) ?? [];
-                                return Card(
-                                  margin:
-                                  const EdgeInsets.only(bottom: 10),
-                                  child: Padding(
-                                    padding: const EdgeInsets.all(12.0),
-                                    child: Column(
-                                      crossAxisAlignment:
-                                      CrossAxisAlignment.start,
-                                      children: [
-                                        Text('${i + 1}. ${q['q']}'),
-                                        const SizedBox(height: 8),
-                                        ...choices
-                                            .asMap()
-                                            .entries
-                                            .map<Widget>((e) {
-                                          return RadioListTile<int>(
-                                            value: e.key,
-                                            groupValue: userAnswers[i],
-                                            onChanged: (val) {
-                                              setState(() =>
-                                              userAnswers[i] = val);
-                                            },
-                                            title: Text(
-                                                e.value.toString()),
-                                            dense: true,
-                                          );
-                                        }).toList(),
-                                      ],
+                        )
+                      // ===== 기존 에디터 화면 =====
+                      : (current == null
+                          ? const Center(
+                              child: Text('왼쪽에서 메모를 선택하거나 상단 + 로 새 메모를 만드세요'),
+                            )
+                          : Padding(
+                              padding: const EdgeInsets.all(14.0),
+                              child: Column(
+                                children: [
+                                  TextField(
+                                    controller: titleCtl,
+                                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                                    decoration: const InputDecoration(hintText: '제목'),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Expanded(
+                                    child: TextField(
+                                      controller: contentCtl,
+                                      maxLines: null,
+                                      expands: true,
+                                      keyboardType: TextInputType.multiline,
+                                      textAlign: TextAlign.start,
+                                      textAlignVertical: TextAlignVertical.top,
+                                      // 좌상단 시작
+                                      decoration: const InputDecoration(
+                                        hintText: '여기에 메모를 작성하세요…',
+                                      ),
                                     ),
                                   ),
-                                );
-                              }).toList(),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Align(
-                            alignment: Alignment.centerRight,
-                            child: FilledButton(
-                              onPressed: _submitAnswers,
-                              child: const Text('제출하기'),
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
+                                ],
+                              ),
+                            )),
                 ),
               ),
             ],
