@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'data/app_db.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:flutter_quill/flutter_quill.dart' as quill hide Text;
+import 'package:flutter_localizations/flutter_localizations.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -22,13 +24,16 @@ class MemoQuizApp extends StatelessWidget {
     final colorScheme = ColorScheme.fromSeed(
       seedColor: blue,
       brightness: Brightness.dark,
-      background: vscodeBg,
+      // NOTE: ColorScheme.fromSeed 에 background 인자는 더 이상 받지 않는 버전이 있습니다.
+      // 필요 시 scaffoldBackgroundColor 로 대체합니다.
     );
 
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'MemoQuiz',
       themeMode: ThemeMode.dark,
+      localizationsDelegates: quill.FlutterQuillLocalizations.localizationsDelegates,
+      supportedLocales: quill.FlutterQuillLocalizations.supportedLocales,
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
@@ -92,6 +97,8 @@ class _HomePageState extends State<HomePage> {
   // 상태 변수들 아래에 추가
   bool _examMode = false;                 // ← 시험 모드 ON/OFF
   final ScrollController _examScroll = ScrollController();
+  quill.QuillController? _quill;
+  final _quillFocus = FocusNode();
 
   static const int kNumQuestions = 10; // 항상 10문제 출제
   static const double kOverlayToolbarHeight = 48.0; // 오버레이 툴바 높이(아이콘/패딩 기준)
@@ -107,9 +114,114 @@ class _HomePageState extends State<HomePage> {
     titleCtl.dispose();
     contentCtl.dispose();
     _examScroll.dispose();
+    _quillFocus.dispose();
+    _quill?.dispose();
     // Drift DB는 앱 종료 때 자동 정리되는 편이지만, 명시하고 싶다면:
     // db.close();
     super.dispose();
+  }
+
+  // DB 문자열 → 문서, 문서 → 저장 문자열 헬퍼
+  quill.Document _docFromDb(String raw) {
+    // Delta JSON이면 파싱, 아니면 일반 텍스트로 문서 생성
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        return quill.Document.fromJson(decoded);
+      }
+    } catch (_) {
+      // ignore
+    }
+    return quill.Document()..insert(0, raw);
+  }
+
+  String _docToDb(quill.Document doc) {
+    // Delta JSON 문자열로 저장
+    final delta = doc.toDelta();
+    return jsonEncode(delta.toJson());
+  }
+
+  // AI에 보낼 순수 텍스트
+  String _plainForAi() => _quill?.document.toPlainText() ?? '';
+
+  // 에디터 위젯 묶음
+  Widget _buildEditor() {
+    return Padding(
+      padding: const EdgeInsets.all(14.0),
+      child: Column(
+        mainAxisSize: MainAxisSize.max,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          TextField(
+            controller: titleCtl,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            decoration: const InputDecoration(hintText: '제목'),
+          ),
+          const SizedBox(height: 8),
+
+          // 툴바: 가로 스크롤 + 고정 높이
+          SizedBox(
+            height: 48,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: quill.QuillSimpleToolbar(
+                controller: _quill!,
+                config: const quill.QuillSimpleToolbarConfig(
+                  // 필요한 버튼만 남김
+                  showBoldButton: true,
+                  showItalicButton: true,
+                  showUnderLineButton: true,
+                  showStrikeThrough: true,
+                  showHeaderStyle: true,
+                  showUndo: true,
+                  showRedo: true,
+
+                  // 나머지 버튼 끄기
+                  showLink: false,
+                  showListNumbers: false,
+                  showListBullets: false,
+                  showListCheck: false,
+                  showInlineCode: false,
+                  showCodeBlock: false,
+                  showQuote: false,
+                  showColorButton: false,
+                  showIndent: false,
+                  showAlignmentButtons: false,
+                  showDirection: false,
+                  showClearFormat: false,
+                  showSearchButton: false,
+                  showClipboardCopy: false,
+                  showClipboardCut: false,
+                  showClipboardPaste: false,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          // 본문 에디터: Expanded + expands:true
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFF252526),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFF3C3C3C)),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: quill.QuillEditor.basic(
+                controller: _quill!,
+                focusNode: _quillFocus,
+                config: const quill.QuillEditorConfig(
+                  expands: true,
+                  placeholder: '여기에 메모를 작성하세요…',
+                  padding: EdgeInsets.only(top: 10),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _refreshList() async {
@@ -128,6 +240,10 @@ class _HomePageState extends State<HomePage> {
       userAnswers = [];
       currentQuizId = null;
       _examMode = false; // ← 추가: 새 메모 시 시험 모드 해제
+      _quill = quill.QuillController(
+        document: quill.Document()..insert(0, ''),
+        selection: const TextSelection.collapsed(offset: 0),
+      );
     });
     _refreshList();
   }
@@ -136,11 +252,11 @@ class _HomePageState extends State<HomePage> {
     if (current == null) return;
     await db.updateTitle(
       current!.id,
-      titleCtl.text
-          .trim()
-          .isEmpty ? '제목 없음' : titleCtl.text.trim(),
+      titleCtl.text.trim().isEmpty ? '제목 없음' : titleCtl.text.trim(),
     );
-    await db.updateContent(current!.id, contentCtl.text);
+    // ✅ quill 문서를 Delta JSON 문자열로 저장
+    final contentToSave = _docToDb(_quill!.document);
+    await db.updateContent(current!.id, contentToSave);
     final m = await db.getMemo(current!.id);
     setState(() => current = m);
     _refreshList();
@@ -165,9 +281,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _generateQuiz() async {
-    if (current == null || contentCtl.text
-        .trim()
-        .isEmpty) return;
+    // NOTE: 기존에는 contentCtl.text 를 검사해서 실제로는 항상 비어있는 것으로 간주되는 문제가 있었습니다.
+    // 에디터 내용(_quill) 기준으로 검사하도록 수정합니다.
+    if (current == null || _plainForAi().trim().isEmpty) return;
 
     setState(() => loading = true);
     try {
@@ -176,7 +292,7 @@ class _HomePageState extends State<HomePage> {
         uri,
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
-          'content': contentCtl.text,
+          'content': _plainForAi(),   // ← _quill에서 뽑은 순수 텍스트
           'num': kNumQuestions, // ← 항상 10문제
           'type': 'mcq',
         }),
@@ -203,7 +319,7 @@ class _HomePageState extends State<HomePage> {
           currentQuizId = quizId;
           _examMode = true; // ← 시험 모드 진입
         });
-        
+
         // 문제 생성 후 자동 스크롤 맨 위
         await Future.delayed(const Duration(milliseconds: 50));
         _examScroll.jumpTo(0.0);
@@ -300,13 +416,12 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     showDialog(
       context: context,
-      builder: (_) =>
-          StatsDialog(
-            memoTitle: current!.title.isEmpty ? '제목 없음' : current!.title,
-            stats: stats,
-            attempts: allAttempts,
-            totalQuestions: kNumQuestions,
-          ),
+      builder: (_) => StatsDialog(
+        memoTitle: current!.title.isEmpty ? '제목 없음' : current!.title,
+        stats: stats,
+        attempts: allAttempts,
+        totalQuestions: kNumQuestions,
+      ),
     );
   }
 
@@ -325,25 +440,24 @@ class _HomePageState extends State<HomePage> {
             color: selected ? const Color(0xFF2A2D2E) : const Color(0xFF2D2D2D),
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
-              color: selected ? const Color(0xFF007ACC) : const Color(
-                  0xFF3C3C3C),
+              color: selected ? const Color(0xFF007ACC) : const Color(0xFF3C3C3C),
               width: selected ? 1.5 : 1,
             ),
             boxShadow: selected
                 ? [
-              BoxShadow(
-                color: const Color(0xFF007ACC).withOpacity(0.25),
-                blurRadius: 8,
-                spreadRadius: 0.5,
-              ),
-            ]
+                    BoxShadow(
+                      color: const Color(0xFF007ACC).withOpacity(0.25),
+                      blurRadius: 8,
+                      spreadRadius: 0.5,
+                    ),
+                  ]
                 : null,
           ),
           child: Stack(
             children: [
               ListTile(
                 contentPadding:
-                const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 title: Row(
                   children: [
                     Expanded(
@@ -377,6 +491,10 @@ class _HomePageState extends State<HomePage> {
                     userAnswers = [];
                     currentQuizId = null;
                     _examMode = false; // ← 추가: 메모 바꿀 때 시험 모드 해제
+                    _quill = quill.QuillController(
+                      document: _docFromDb(current?.content ?? ''),
+                      selection: const TextSelection.collapsed(offset: 0),
+                    );
                   });
                 },
               ),
@@ -421,8 +539,7 @@ class _HomePageState extends State<HomePage> {
         children: [
           Icon(icon, size: 14, color: Colors.white),
           const SizedBox(width: 6),
-          Text(
-              label, style: const TextStyle(fontSize: 12, color: Colors.white)),
+          Text(label, style: const TextStyle(fontSize: 12, color: Colors.white)),
         ],
       ),
     );
@@ -435,6 +552,7 @@ class _HomePageState extends State<HomePage> {
 
     return Scaffold(
       body: Stack(
+        fit: StackFit.expand,
         children: [
           // (A) 본 레이아웃: 왼쪽 사이드바 + 구분선 + 오른쪽 에디터
           Row(
@@ -449,7 +567,7 @@ class _HomePageState extends State<HomePage> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       const Padding(
-                        padding: EdgeInsets.only(top:12, left: 4, bottom: 6),
+                        padding: EdgeInsets.only(top: 12, left: 4, bottom: 6),
                         child: Text(
                           '메모 목록',
                           textAlign: TextAlign.center,
@@ -550,38 +668,38 @@ class _HomePageState extends State<HomePage> {
                                       const SizedBox(width: 8),
                                       const Text('시험 모드', style: TextStyle(fontWeight: FontWeight.bold)),
                                       const Spacer(),
-                                                                             // (선택) 취소 버튼: 제출 없이 나가기
-                                                                               TextButton(
-                                          onPressed: () {
-                                            final answered = userAnswers.where((e) => e != null).length;
-                                            showDialog(
-                                              context: context,
-                                              builder: (context) => AlertDialog(
-                                                backgroundColor: const Color(0xFF252526),
-                                                title: const Text('시험 모드 종료'),
-                                                content: Text('제출하지 않고 나가시겠습니까?\n현재 ${answered}/${quiz.length}문항에 답했습니다.\n답변은 저장되지 않습니다.'),
-                                                actions: [
-                                                 TextButton(
-                                                   onPressed: () => Navigator.of(context).pop(),
-                                                   child: const Text('취소'),
-                                                 ),
-                                                 TextButton(
-                                                   onPressed: () {
-                                                     Navigator.of(context).pop();
-                                                     setState(() {
-                                                       _examMode = false;
-                                                       // 필요 시 문제 유지/초기화 선택
-                                                       // quiz = []; userAnswers = [];
-                                                     });
-                                                   },
-                                                   child: const Text('나가기'),
-                                                 ),
-                                               ],
-                                             ),
-                                           );
-                                         },
-                                         child: const Text('나가기'),
-                                       ),
+                                      // (선택) 취소 버튼: 제출 없이 나가기
+                                      TextButton(
+                                        onPressed: () {
+                                          final answered = userAnswers.where((e) => e != null).length;
+                                          showDialog(
+                                            context: context,
+                                            builder: (context) => AlertDialog(
+                                              backgroundColor: const Color(0xFF252526),
+                                              title: const Text('시험 모드 종료'),
+                                              content: Text('제출하지 않고 나가시겠습니까?\n현재 ${answered}/${quiz.length}문항에 답했습니다.\n답변은 저장되지 않습니다.'),
+                                              actions: [
+                                                TextButton(
+                                                  onPressed: () => Navigator.of(context).pop(),
+                                                  child: const Text('취소'),
+                                                ),
+                                                TextButton(
+                                                  onPressed: () {
+                                                    Navigator.of(context).pop();
+                                                    setState(() {
+                                                      _examMode = false;
+                                                      // 필요 시 문제 유지/초기화 선택
+                                                      // quiz = []; userAnswers = [];
+                                                    });
+                                                  },
+                                                  child: const Text('나가기'),
+                                                ),
+                                              ],
+                                            ),
+                                          );
+                                        },
+                                        child: const Text('나가기'),
+                                      ),
                                     ],
                                   ),
                                 ),
@@ -602,53 +720,27 @@ class _HomePageState extends State<HomePage> {
                                     borderRadius: BorderRadius.vertical(bottom: Radius.circular(10)),
                                   ),
                                   padding: const EdgeInsets.symmetric(horizontal: 12),
-                                                                     child: Row(
-                                     children: [
-                                       const Text('모든 문항에 답을 선택한 후 제출하세요'),
-                                       const Spacer(),
-                                       FilledButton(
-                                         onPressed: userAnswers.any((e) => e == null) ? null : _submitAnswers,
-                                         child: const Text('제출'),
-                                       ),
-                                     ],
-                                   ),
+                                  child: Row(
+                                    children: [
+                                      const Text('모든 문항에 답을 선택한 후 제출하세요'),
+                                      const Spacer(),
+                                      FilledButton(
+                                        onPressed: userAnswers.any((e) => e == null) ? null : _submitAnswers,
+                                        child: const Text('제출'),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ],
                           ),
                         )
-                      // ===== 기존 에디터 화면 =====
-                      : (current == null
-                          ? const Center(
-                              child: Text('왼쪽에서 메모를 선택하거나 상단 + 로 새 메모를 만드세요'),
-                            )
-                          : Padding(
-                              padding: const EdgeInsets.all(14.0),
-                              child: Column(
-                                children: [
-                                  TextField(
-                                    controller: titleCtl,
-                                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                                    decoration: const InputDecoration(hintText: '제목'),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Expanded(
-                                    child: TextField(
-                                      controller: contentCtl,
-                                      maxLines: null,
-                                      expands: true,
-                                      keyboardType: TextInputType.multiline,
-                                      textAlign: TextAlign.start,
-                                      textAlignVertical: TextAlignVertical.top,
-                                      // 좌상단 시작
-                                      decoration: const InputDecoration(
-                                        hintText: '여기에 메모를 작성하세요…',
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            )),
+                                          // ===== 기존 에디터 화면 =====
+                    : (current == null
+                        ? const Center(
+                            child: Text('왼쪽에서 메모를 선택하거나 상단 + 로 새 메모를 만드세요'),
+                          )
+                        : _buildEditor()),
                 ),
               ),
             ],
@@ -679,8 +771,7 @@ class _HomePageState extends State<HomePage> {
                     icon: const Icon(Icons.bar_chart)),
                 const SizedBox(width: 8),
                 FilledButton.icon(
-                  onPressed:
-                  (loading || current == null) ? null : _generateQuiz,
+                  onPressed: (loading || current == null) ? null : _generateQuiz,
                   icon: const Icon(Icons.auto_awesome),
                   label: const Text('문제 생성'),
                   style: FilledButton.styleFrom(
@@ -698,7 +789,10 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
-  /// 통계/기록 다이얼로그 (VS Code 다크 톤으로 조정)
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  통계/기록 다이얼로그 (VS Code 다크 톤으로 조정)
+//  ────────────────────────────────────────────────────────────────────────────
 class StatsDialog extends StatelessWidget {
   final String memoTitle;
   final MemoStats stats;
@@ -907,12 +1001,12 @@ class QuizReviewPage extends StatelessWidget {
             const Text('시도 기록'),
             const SizedBox(height: 6),
             ...attempts.map<Widget>((a) => Card(
-              color: cardBg,
-              child: ListTile(
-                title: Text('시도 ${a.id} - 점수 ${a.score * 10}점'),
-                subtitle: Text(a.createdAt.toString()),
-              ),
-            )),
+                  color: cardBg,
+                  child: ListTile(
+                    title: Text('시도 ${a.id} - 점수 ${a.score * 10}점'),
+                    subtitle: Text(a.createdAt.toString()),
+                  ),
+                )),
           ],
         ),
       ),
