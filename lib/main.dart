@@ -102,6 +102,8 @@ class _HomePageState extends State<HomePage> {
 
   static const int kNumQuestions = 10; // 항상 10문제 출제
   static const double kOverlayToolbarHeight = 48.0; // 오버레이 툴바 높이(아이콘/패딩 기준)
+  static const double kExamTopBarHeight = 44.0;      // 시험 모드 상단바 높이
+  static const double kExamBottomBarHeight = 64.0;   // 하단 제출바 높이
 
   @override
   void initState() {
@@ -143,6 +145,77 @@ class _HomePageState extends State<HomePage> {
 
   // AI에 보낼 순수 텍스트
   String _plainForAi() => _quill?.document.toPlainText() ?? '';
+
+  // 메모 전체 텍스트에서 문장 단위로 자르기
+  List<String> _splitSentences(String text) {
+    return text
+        .split(RegExp(r'(?<=[\.?\!])\s+|\n+'))
+        .where((s) => s.trim().isNotEmpty)
+        .toList();
+  }
+
+  // 간단 토크나이저(질문/정답에서 키워드 뽑기)
+  List<String> _extractTokens(String text) {
+    final raw = text
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^\p{L}\p{N}\s]', unicode: true), '');
+    final parts = raw.split(RegExp(r'\s+')).where((w) => w.trim().isNotEmpty);
+    return parts.where((w) => w.length >= 2).toList();
+  }
+
+  // 질문 객체(q, choices, answerIndex)를 바탕으로, 메모 텍스트에서 가장 관련있는 문장 찾기
+  Map<String, dynamic> _locateSourceForQuestion(
+    Map q,
+    String memoPlainText,
+  ) {
+    final question = (q['q'] ?? '').toString();
+    final choices = (q['choices'] as List?) ?? const [];
+    final answerIndex = (q['answerIndex'] as int?) ?? -1;
+    final correct =
+        (answerIndex >= 0 && answerIndex < choices.length) ? choices[answerIndex].toString() : '';
+
+    final tokens = <String>[
+      ..._extractTokens(question),
+      ..._extractTokens(correct),
+      ..._extractTokens((q['explanation'] ?? '').toString()),
+    ].toSet().toList();
+
+    final sentences = _splitSentences(memoPlainText);
+    if (sentences.isEmpty) {
+      return {'snippet': '', 'sentIndex': -1};
+    }
+
+    int scoreFor(String s) {
+      final low = s.toLowerCase();
+      var score = 0;
+      for (final t in tokens) {
+        if (t.isEmpty) continue;
+        if (low.contains(t)) score += t.length;
+      }
+      return score;
+    }
+
+    var bestIdx = 0;
+    var bestScore = -1;
+    for (var i = 0; i < sentences.length; i++) {
+      final sc = scoreFor(sentences[i]);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestIdx = i;
+      }
+    }
+
+    if (bestScore <= 0) {
+      final s = sentences.first;
+      return {'snippet': s.trim(), 'sentIndex': 0};
+    }
+
+    final prev = (bestIdx - 1 >= 0) ? sentences[bestIdx - 1] : '';
+    final curr = sentences[bestIdx];
+    final next = (bestIdx + 1 < sentences.length) ? sentences[bestIdx + 1] : '';
+    final snippet = [prev, curr, next].where((x) => x.trim().isNotEmpty).join(' ');
+    return {'snippet': snippet.trim(), 'sentIndex': bestIdx};
+  }
 
   // 에디터 위젯 묶음
   Widget _buildEditor() {
@@ -265,6 +338,17 @@ class _HomePageState extends State<HomePage> {
         .showSnackBar(const SnackBar(content: Text('저장 완료')));
   }
 
+  Future<void> _applyTidyAndSave(String tidy) async {
+    if (current == null) return;
+    setState(() {
+      _quill = quill.QuillController(
+        document: quill.Document()..insert(0, tidy.trimRight()),
+        selection: const TextSelection.collapsed(offset: 0),
+      );
+    });
+    await _save();
+  }
+
   Future<void> _delete() async {
     if (current == null) return;
     await db.deleteMemo(current!.id);
@@ -309,12 +393,23 @@ class _HomePageState extends State<HomePage> {
           setState(() => _examMode = false);
           return;
         }
+
+        // 출처 스니펫 붙이기
+        final memoText = _plainForAi();
+        final enriched = qs.map((raw) {
+          final qMap = Map<String, dynamic>.from(raw as Map);
+          final src = _locateSourceForQuestion(qMap, memoText);
+          qMap['sourceSnippet'] = src['snippet'];
+          qMap['sourceIndex'] = src['sentIndex'];
+          return qMap;
+        }).toList();
+
         setState(() {
-          quiz = qs;
+          quiz = enriched;
           userAnswers = List<int?>.filled(quiz.length, null);
         });
-        // DB에 퀴즈 저장
-        final quizId = await db.addQuiz(current!.id, jsonEncode(quiz));
+        // DB에 퀴즈 저장(enriched)
+        final quizId = await db.addQuiz(current!.id, jsonEncode(enriched));
         setState(() {
           currentQuizId = quizId;
           _examMode = true; // ← 시험 모드 진입
@@ -338,7 +433,6 @@ class _HomePageState extends State<HomePage> {
   Future<void> _submitAnswers() async {
     if (quiz.isEmpty || currentQuizId == null) return;
 
-    // 답변하지 않은 문항이 있는지 확인
     if (userAnswers.any((e) => e == null)) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -352,29 +446,46 @@ class _HomePageState extends State<HomePage> {
 
     int score = 0;
     for (int i = 0; i < quiz.length; i++) {
-      if (userAnswers[i] == quiz[i]['answerIndex']) {
-        score++;
-      }
+      if (userAnswers[i] == quiz[i]['answerIndex']) score++;
     }
 
-    await db.addAttempt(currentQuizId!, jsonEncode(userAnswers), score);
-
-    if (!mounted) return;
-    final total = quiz.length; // ← 실제 출제 문항 수
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('점수: ${score * 10}점 / ${total * 10}점 만점 (${score}/${total})')),
+    // 시도 저장
+    await db.addAttempt(
+      currentQuizId!,
+      jsonEncode(userAnswers), // 사용자가 고른 보기 인덱스 배열
+      score,                   // 정답 개수
     );
 
-    // ⬇️ 시험 모드 종료 + 문제 패널 닫기
-    setState(() {
-      _examMode = false;
-      // 필요하면 문제는 남겨두고 싶다면 아래 두 줄은 주석 처리
-      // quiz = [];
-      // userAnswers = [];
-    });
+    if (!mounted) return;
 
-    // 통계 갱신 등
+    // 시험 모드 종료 & 리스트 갱신
+    setState(() => _examMode = false);
     _refreshList();
+
+    // 결과 화면으로 이동 (Google Forms 스타일)
+    final result = await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => QuizResultPage(
+          quiz: List<Map<String, dynamic>>.from(
+            quiz.map((e) => Map<String, dynamic>.from(e as Map)),
+          ),
+          userAnswers: List<int>.from(userAnswers.map((e) => e!)),
+          totalCorrect: score,
+          memoPlainText: _plainForAi(),
+        ),
+      ),
+    );
+
+    // 결과 화면에서 '다시 풀기'를 누르면 재시작
+    if (!mounted) return;
+    if (result == 'retake') {
+      setState(() {
+        _examMode = true;
+        userAnswers = List<int?>.filled(quiz.length, null);
+      });
+      await Future.delayed(const Duration(milliseconds: 50));
+      _examScroll.jumpTo(0.0);
+    }
   }
 
   /// 메모별 통계 계산(모든 퀴즈의 모든 시도를 합산)
@@ -423,6 +534,20 @@ class _HomePageState extends State<HomePage> {
         totalQuestions: kNumQuestions,
       ),
     );
+  }
+
+  Future<void> _openTidyDialog() async {
+    if (current == null) return;
+    final original = _plainForAi();
+
+    final appliedText = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => TidyDialog(originalText: original),
+    );
+    if (appliedText != null) {
+      await _applyTidyAndSave(appliedText);
+    }
   }
 
   // 메모 카드 UI (VS Code 스타일 + 통계 배지)
@@ -614,7 +739,12 @@ class _HomePageState extends State<HomePage> {
                               Positioned.fill(
                                 child: ListView.builder(
                                   controller: _examScroll,
-                                  padding: const EdgeInsets.fromLTRB(14, 14, 14, 80),
+                                  padding: const EdgeInsets.fromLTRB(
+                                    14,
+                                    14 + kExamTopBarHeight,
+                                    14,
+                                    16 + kExamBottomBarHeight,
+                                  ),
                                   itemCount: quiz.length,
                                   itemBuilder: (context, idx) {
                                     final q = quiz[idx];
@@ -653,7 +783,7 @@ class _HomePageState extends State<HomePage> {
                                 right: 0,
                                 top: 0,
                                 child: Container(
-                                  height: 44,
+                                  height: kExamTopBarHeight,
                                   decoration: const BoxDecoration(
                                     color: Color(0xFF2D2D2D),
                                     border: Border(
@@ -711,7 +841,7 @@ class _HomePageState extends State<HomePage> {
                                 right: 0,
                                 bottom: 0,
                                 child: Container(
-                                  height: 64,
+                                  height: kExamBottomBarHeight,
                                   decoration: const BoxDecoration(
                                     color: Color(0xFF2D2D2D),
                                     border: Border(
@@ -777,6 +907,19 @@ class _HomePageState extends State<HomePage> {
                   style: FilledButton.styleFrom(
                     backgroundColor: blue,
                     foregroundColor: Colors.white,
+                    disabledBackgroundColor: const Color(0xFF3A3D41),
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                  ),
+                ),
+                // 👇 메모 정리 버튼 (아이보리)
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: (loading || current == null || _examMode) ? null : _openTidyDialog,
+                  icon: const Icon(Icons.auto_fix_high),
+                  label: const Text('메모 정리'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFF2EEDC),
+                    foregroundColor: const Color(0xFF1E1E1E),
                     disabledBackgroundColor: const Color(0xFF3A3D41),
                     padding: const EdgeInsets.symmetric(horizontal: 14),
                   ),
@@ -1009,6 +1152,493 @@ class QuizReviewPage extends StatelessWidget {
                 )),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// 결과 화면: 사용자가 고른 답/정답/해설 표시 + 다시 풀기/닫기
+class QuizResultPage extends StatelessWidget {
+  final List<Map<String, dynamic>> quiz;
+  final List<int> userAnswers;
+  final int totalCorrect;
+  final String memoPlainText;
+
+  const QuizResultPage({
+    super.key,
+    required this.quiz,
+    required this.userAnswers,
+    required this.totalCorrect,
+    required this.memoPlainText,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    void _showSourceBottomSheet(BuildContext context, String full, String snippet) {
+      showModalBottomSheet(
+        context: context,
+        isScrollControlled: true,
+        builder: (_) {
+          Widget highlighted(String text, String query) {
+            final lowText = text.toLowerCase();
+            final lowQuery = query.toLowerCase();
+            final idx = lowText.indexOf(lowQuery);
+            if (idx < 0 || query.trim().isEmpty) {
+              return const SelectableText(
+                '',
+              );
+            }
+            final before = text.substring(0, idx);
+            final mid = text.substring(idx, idx + query.length);
+            final after = text.substring(idx + query.length);
+            return SelectableText.rich(
+              TextSpan(children: [
+                const TextSpan(text: '', style: TextStyle(color: Colors.white70)),
+                TextSpan(text: before, style: const TextStyle(color: Colors.white70)),
+                TextSpan(
+                  text: mid,
+                  style: const TextStyle(
+                    color: Color(0xFFE53935),
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                TextSpan(text: after, style: const TextStyle(color: Colors.white70)),
+              ]),
+            );
+          }
+
+          return DraggableScrollableSheet(
+            expand: false,
+            minChildSize: 0.4,
+            initialChildSize: 0.7,
+            builder: (context, controller) {
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: SingleChildScrollView(
+                  controller: controller,
+                  child: highlighted(full, snippet),
+                ),
+              );
+            },
+          );
+        },
+      );
+    }
+    const panelBg = Color(0xFF252526);
+    const cardBg  = Color(0xFF2D2D2D);
+    const green   = Color(0xFF2E7D32);
+    const red     = Color(0xFFB00020);
+    const blue    = Color(0xFF007ACC);
+
+    final total = quiz.length;
+
+    Widget metric(IconData icon, String title, String value, {Color? color}) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: cardBg,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF3C3C3C)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: (color ?? blue).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(icon, color: color ?? blue, size: 20),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: const TextStyle(color: Color(0xFFBBBBBB), fontSize: 12)),
+                  const SizedBox(height: 6),
+                  Text(value, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('풀이 결과'),
+        centerTitle: false,
+      ),
+      body: Container(
+        color: panelBg,
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Expanded(child: metric(Icons.task_alt, '정답 수', '$totalCorrect/$total', color: green)),
+                const SizedBox(width: 10),
+                Expanded(child: metric(Icons.percent, '점수', '${totalCorrect * 10}점', color: blue)),
+              ],
+            ),
+            const SizedBox(height: 14),
+
+            Expanded(
+              child: ListView.builder(
+                itemCount: total,
+                itemBuilder: (context, i) {
+                  final q = quiz[i];
+                  final choices = (q['choices'] as List?) ?? const [];
+                  final answerIndex = (q['answerIndex'] as int?) ?? -1;
+                  final userIdx = userAnswers[i];
+                  final correct = userIdx == answerIndex;
+
+                  Color borderColor(bool isCorrect, bool isUserWrongPick) {
+                    if (isCorrect) return green.withOpacity(0.7);
+                    if (isUserWrongPick) return red.withOpacity(0.7);
+                    return const Color(0xFF3C3C3C);
+                  }
+
+                  return Card(
+                    color: cardBg,
+                    margin: const EdgeInsets.only(bottom: 10),
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(correct ? Icons.check_circle : Icons.cancel,
+                                  color: correct ? green : red, size: 18),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text('${i + 1}. ${q['q']}',
+                                  style: const TextStyle(fontWeight: FontWeight.w600)),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          ...choices.asMap().entries.map((e) {
+                            final idx = e.key;
+                            final text = e.value.toString();
+                            final isCorrect = idx == answerIndex;
+                            final isUserPick = idx == userIdx;
+                            final isUserWrongPick = isUserPick && !isCorrect;
+
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 6),
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: isCorrect
+                                    ? green.withOpacity(0.18)
+                                    : (isUserWrongPick
+                                        ? red.withOpacity(0.18)
+                                        : cardBg),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: borderColor(isCorrect, isUserWrongPick),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isCorrect
+                                        ? Icons.check
+                                        : (isUserWrongPick
+                                            ? Icons.close
+                                            : Icons.circle_outlined),
+                                    size: 16,
+                                    color: isCorrect
+                                        ? green
+                                        : (isUserWrongPick
+                                            ? red
+                                            : const Color(0xFFBBBBBB)),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(child: Text(text)),
+                                ],
+                              ),
+                            );
+                          }),
+
+                          if ((q['explanation'] ?? '').toString().trim().isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            Text('해설: ${q['explanation']}',
+                                style: const TextStyle(color: Color(0xFFBBBBBB))),
+                          ],
+
+                          // 출처(메모) 표시 + 원문 보기
+                          () {
+                            final source = (q['sourceSnippet'] ?? '').toString().trim();
+                            if (source.isEmpty) return const SizedBox.shrink();
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const SizedBox(height: 8),
+                                Container(
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF1F1F1F),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: const Color(0xFF3C3C3C)),
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text('출처(메모 내용)',
+                                          style: TextStyle(fontWeight: FontWeight.w700)),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        source,
+                                        style: const TextStyle(color: Color(0xFFBBBBBB)),
+                                      ),
+                                      Align(
+                                        alignment: Alignment.centerRight,
+                                        child: TextButton.icon(
+                                          onPressed: () => _showSourceBottomSheet(context, memoPlainText, source),
+                                          icon: const Icon(Icons.chrome_reader_mode, size: 16),
+                                          label: const Text('원문 보기'),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            );
+                          }(),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+
+            Row(
+              children: [
+                OutlinedButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('닫기'),
+                ),
+                const Spacer(),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).pop('retake'),
+                  child: const Text('다시 풀기'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class TidyDialog extends StatefulWidget {
+  final String originalText;
+  const TidyDialog({super.key, required this.originalText});
+
+  @override
+  State<TidyDialog> createState() => _TidyDialogState();
+}
+
+class _TidyDialogState extends State<TidyDialog> {
+  String? tidyText;
+  String? errorMsg;
+  bool loading = true;
+  bool saving = false;
+  // 두 패널용 컨트롤러
+  final _leftScroll = ScrollController();
+  final _rightScroll = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _runTidy();
+  }
+
+  @override
+  void dispose() {
+    _leftScroll.dispose();
+    _rightScroll.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runTidy() async {
+    try {
+      final uri = Uri.parse('http://localhost:8787/tidy');
+      final res = await http.post(
+        uri,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'content': widget.originalText,
+          'style': 'concise vsc-dark bullet/heading friendly',
+        }),
+      );
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final t = (data['tidy'] ?? data['text'] ?? '').toString().trim();
+        if (t.isEmpty) throw Exception('서버 결과가 비어 있습니다.');
+        setState(() {
+          tidyText = t;
+          loading = false;
+        });
+      } else {
+        throw Exception('서버 오류: ${res.statusCode}');
+      }
+    } catch (e) {
+      final fallback = widget.originalText
+          .replaceAll(RegExp(r'[ \t]+'), ' ')
+          .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+          .trim();
+
+      setState(() {
+        errorMsg = '$e';
+        tidyText = fallback.isEmpty ? null : fallback;
+        loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const panelBg = Color(0xFF252526);
+    const cardBg  = Color(0xFF2D2D2D);
+
+    return AlertDialog(
+      backgroundColor: panelBg,
+      titlePadding: const EdgeInsets.fromLTRB(20, 16, 16, 0),
+      contentPadding: const EdgeInsets.all(12),
+      title: Row(
+        children: const [
+          Icon(Icons.auto_fix_high, color: Color(0xFF007ACC)),
+          SizedBox(width: 8),
+          Text('메모 정리 미리보기', style: TextStyle(fontWeight: FontWeight.bold)),
+        ],
+      ),
+      content: SizedBox(
+        width: 920,
+        height: 540,
+        child: Column(
+          children: [
+            if (errorMsg != null) ...[
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF4E342E),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  'AI 요청에 실패했습니다. 임시 정리본으로 미리보기를 제공합니다.\n$errorMsg',
+                  style: const TextStyle(color: Colors.white),
+                ),
+              ),
+            ],
+            Expanded(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _pane(
+                      title: '변경 전 (원문)',
+                      text: widget.originalText,
+                      cardBg: cardBg,
+                      controller: _leftScroll,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: loading
+                        ? _loadingPane(cardBg)
+                        : _pane(
+                            title: '변경 후 (정리본)',
+                            text: tidyText ?? '',
+                            cardBg: cardBg,
+                            controller: _rightScroll,
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('취소'),
+        ),
+        TextButton.icon(
+          icon: const Icon(Icons.check),
+          label: const Text('적용'),
+          onPressed: (saving || (tidyText ?? '').trim().isEmpty)
+              ? null
+              : () async {
+                  setState(() => saving = true);
+                  // 즉시 저장은 다이얼로그 밖(HomePageState)에서 처리하되, 값만 반환
+                  Navigator.of(context).pop(tidyText);
+                },
+        ),
+      ],
+    );
+  }
+
+  Widget _loadingPane(Color cardBg) {
+    return Container(
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF3C3C3C)),
+      ),
+      child: const Center(
+        child: Padding(
+          padding: EdgeInsets.all(12.0),
+          child: CircularProgressIndicator(),
+        ),
+      ),
+    );
+  }
+
+  Widget _pane({
+    required String title,
+    required String text,
+    required Color cardBg,
+    required ScrollController controller,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF3C3C3C)),
+      ),
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title,
+              style: const TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Scrollbar(
+              controller: controller,
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                controller: controller,
+                padding: const EdgeInsets.all(8),
+                child: SelectableText(
+                  (text.isEmpty ? ' ' : text),
+                  style: const TextStyle(color: Colors.white70),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
